@@ -1,0 +1,184 @@
+---
+title: "Kaggle kernel bot script"
+---
+
+This script has been automatically generated. It's aim is to apply simple machine learning code to the data within the dataset.
+
+First, let's load some modules that we'll be using,
+
+```{r setup, include=FALSE}
+suppressMessages(library(pROC))
+suppressMessages(library(caret))
+suppressMessages(library(Boruta))
+```
+
+List all the CSV files available,
+
+```{r}
+candidate_dir = '../input/'
+csv_files = list.files(candidate_dir, recursive = T, full.names = T)
+csv_files = csv_files[grep('.csv', csv_files)]
+csv_files
+```
+
+Load the first one (future versions could try them all, or try to ascertain which is the main csv file from the metadata?),
+
+```{r}
+candidate = read.csv(csv_files[1], stringsAsFactors = F)
+```
+
+Let's take a look,
+
+```{r}
+head(candidate)
+```
+
+
+We need the column corresponding to the 'target' variable. Let's try to figure that out by finding all the columns with only 2 possible entries,
+
+```{r}
+binary = vector()
+i=1
+
+while (i<=dim(candidate)[2]) {
+  
+  binary[i] = length(table(candidate[,i])) == 2
+  i=i+1
+  
+}
+
+table(binary)[2]
+
+col_cands = colnames(candidate)[binary]
+col_cands = col_cands[!col_cands %in% c('gender', 'Gender', 'sex', 'Sex')] #A bit of a hack, but often these columns exist as predictor variables
+col_cands
+```
+
+These are the 'candidate columns'. Let's use the first one (again, future versions could try them all, or try to ascertain which is the main csv file from the metadata?)
+
+Now, let's find out which columns to remove. These are columns that contain too many 'NA' values. If the percentage of NA values is less than 30%, let's impute the missing values with either the mean (if numeric) or the most common entry (if a character or factor),
+
+```{r}
+to_remove = vector()
+i=1
+while (i<=dim(candidate)[2]) {
+  
+  perc_na = length(candidate[,i])/table(is.na(candidate[,i]))[2]
+  if (is.na(perc_na) & !is.na(candidate[1,i])) {perc_na = 0}
+  if (is.na(perc_na) & is.na(candidate[1,i])) {to_remove = c(to_remove, colnames(candidate)[i])}
+  if (!is.na(perc_na)) {
+    if (perc_na > 0.3) {to_remove = c(to_remove, colnames(candidate)[i])}
+    if (perc_na > 0 & perc_na <= 0.3) {
+      if (is.numeric(candidate[,i])) {
+        candidate[,i][is.na(candidate[,i])] = mean(candidate[,i], na.rm = T)
+      }
+      if (is.character(candidate[,i]) | is.factor(candidate[,i])) {
+        candidate[,i][is.na(candidate[,i])] = names(sort(table(candidate[,i], useNA = F), 
+                                                         decreasing = T)[1])
+      } else {to_remove = c(to_remove, colnames(candidate)[i])}}
+  }
+  i=i+1
+}
+
+to_remove
+```
+
+These are the columns to be removed (if any). Let's remove them,
+
+```{r}
+candidate = candidate[,!colnames(candidate) %in% to_remove]
+```
+
+Now let's call the 2 entries in the candidate target column 'class 1' and 'class 2'. You'll have to pay attention to what these correspond to in the dataset at the end of the analysis,
+
+```{r}
+classes = table(candidate[,colnames(candidate) == col_cands[1]])
+candidate[,colnames(candidate) == col_cands[1]][candidate[,colnames(candidate) == col_cands[1]] == names(classes[1])] = 'class1'
+candidate[,colnames(candidate) == col_cands[1]][candidate[,colnames(candidate) == col_cands[1]] == names(classes[2])] = 'class2'
+candidate[,colnames(candidate) == col_cands[1]] = as.factor(candidate[,colnames(candidate) == col_cands[1]])
+```
+
+Now, let's remove any columns that aren't of any predictive use. We'll use the Boruta module for that,
+
+```{r}
+set.seed(1)
+bor.results <- Boruta(candidate, candidate[,colnames(candidate) == col_cands[1]], maxRuns=20, doTrace=0)
+
+par(mar=c(14,4.1,4.1,2.1))
+plot(bor.results, las = 2, xlab = "")
+
+att = getSelectedAttributes(bor.results, withTentative = F)
+candidate_bor = candidate[att]
+```
+
+Next, let's put together a simple logistic regression model (GLM),
+
+```{r}
+set.seed(1) #Set seed to ensure reproducible results
+fitControl <- trainControl(method = "repeatedcv", number = 10, repeats = 20, summaryFunction = twoClassSummary,
+                           classProbs = TRUE, savePredictions = T)
+
+new_dt = candidate_bor[,colnames(candidate_bor) != col_cands[1]]
+new_dt = cbind(new_dt, candidate_bor[,colnames(candidate_bor) == col_cands[1]])
+colnames(new_dt)[dim(new_dt)[2]] = 'target'
+
+set.seed(825)
+model_glm = suppressWarnings(train(target ~ ., 
+              data = new_dt,
+              method = "glm",
+              trControl = fitControl,
+              metric = "ROC"))
+
+getTrainPerf(model_glm) #Internal CV performance
+```
+
+This is the performance of the model. How about a Gradient Boosting Machine model and a Random Forest model?
+
+```{r}
+set.seed(825)
+model_gbm = train(target ~ ., 
+              data = new_dt,
+              method = "gbm",
+              verbose = F,
+              trControl = fitControl,
+              metric = "ROC")
+
+set.seed(825)
+model_rf = train(target ~ ., 
+              data = new_dt,
+              method = "rf",
+              trControl = fitControl,
+              metric = "ROC")
+```
+Let's create some ROC plots,
+
+```{r}
+roc_glm = roc(as.numeric(candidate_bor[,colnames(candidate_bor) == col_cands[1]]=='class1'),
+          aggregate(class1~rowIndex,model_glm$pred,mean)[,'class1'], ci=T)
+
+roc_gbm = roc(as.numeric(candidate_bor[,colnames(candidate_bor) == col_cands[1]]=='class1'),
+          aggregate(class1~rowIndex,model_gbm$pred,mean)[,'class1'], ci=T)
+
+roc_rf = roc(as.numeric(candidate_bor[,colnames(candidate_bor) == col_cands[1]]=='class1'),
+          aggregate(class1~rowIndex,model_rf$pred,mean)[,'class1'], ci=T)
+```
+
+Here are the ROC plot details.
+
+```{r}
+coords(roc_glm, x = "local maximas")
+```
+
+These are the local maximas from the GLM ROC plot.
+
+```{r}
+par(pty="s")
+plot(roc_glm)
+lines(roc_gbm, col = 'red')
+lines(roc_rf, col = 'blue')
+legend(0.35, 0.5, legend=c("GLM", "GBM", "RF"), col=c("black", "red", "blue"), lty=1:2, cex=0.8)
+```
+
+This is the ROC plot.
+
+Hopefully this script has given you ideas of where to go next. Good luck!
